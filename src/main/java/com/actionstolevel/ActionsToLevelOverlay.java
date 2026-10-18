@@ -78,8 +78,14 @@ class ActionsToLevelOverlay extends OverlayPanel
 				: action.skill.getName() + " " + shownLevel + " > " + p.targetLevel;
 			final boolean underLevel = action.levelRequired > p.currentLevel;
 
+			String left = underLevel ? goal + " (needs " + action.levelRequired + ")" : goal;
+			if (action.note != null)
+			{
+				left += " (" + action.note + ")";
+			}
+
 			panelComponent.getChildren().add(LineComponent.builder()
-				.left(underLevel ? goal + " (needs " + action.levelRequired + ")" : goal)
+				.left(left)
 				.leftColor(underLevel ? WARN : SUBTLE)
 				.right(plugin.formatXp(action.xpEach) + " xp")
 				.rightColor(SUBTLE)

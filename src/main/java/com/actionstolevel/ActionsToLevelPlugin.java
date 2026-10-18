@@ -27,13 +27,17 @@ import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.NPC;
 import net.runelite.api.Skill;
+import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.StatChanged;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.chat.ChatColorType;
@@ -43,22 +47,24 @@ import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.NPCManager;
 import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.slayer.SlayerPlugin;
+import net.runelite.client.plugins.slayer.SlayerPluginService;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.Text;
 
 @PluginDescriptor(
 	name = "Actions To Level",
-	description = "Shows how many more of an item, or how many more actions, you need to level up",
-	tags = {"xp", "level", "skilling", "actions", "calculator", "goal", "mining", "woodcutting", "fishing"}
+	description = "Shows how many more items, actions or kills you need to level up",
+	tags = {"xp", "level", "skilling", "actions", "calculator", "goal", "kills", "combat", "slayer", "mining", "woodcutting", "fishing"}
 )
+@PluginDependency(SlayerPlugin.class)
 public class ActionsToLevelPlugin extends Plugin
 {
 	static final String MENU_OPTION = "Actions to level";
-
-	private static final Set<Skill> COMBAT_SKILLS = EnumSet.of(
-		Skill.ATTACK, Skill.STRENGTH, Skill.DEFENCE, Skill.RANGED, Skill.HITPOINTS, Skill.SLAYER);
 
 	/** An XP drop is credited to the last clicked object/NPC for this many ticks (~5 minutes). */
 	private static final int TARGET_MEMORY_TICKS = 500;
@@ -105,7 +111,14 @@ public class ActionsToLevelPlugin extends Plugin
 	@Inject
 	private XpTable xpTable;
 
+	@Inject
+	private NPCManager npcManager;
+
+	@Inject
+	private SlayerPluginService slayerService;
+
 	private final LearnedRates learned = new LearnedRates();
+	private CombatTracker combat;
 	private final Map<Skill, Integer> lastXp = new EnumMap<>(Skill.class);
 	private final Map<Skill, Integer> pendingXp = new EnumMap<>(Skill.class);
 	/** Most recently updated entry last. Only touched on the client thread. */
@@ -130,6 +143,7 @@ public class ActionsToLevelPlugin extends Plugin
 	protected void startUp()
 	{
 		learned.deserialize(configManager.getConfiguration(ActionsToLevelConfig.GROUP, ActionsToLevelConfig.LEARNED_RATES_KEY));
+		combat = new CombatTracker(client, npcManager, slayerService, learned);
 		overlayManager.add(overlay);
 		resetSession();
 
@@ -156,6 +170,10 @@ public class ActionsToLevelPlugin extends Plugin
 		pendingWaitedATick = false;
 		loginGraceTicks = 0;
 		lastTarget = null;
+		if (combat != null)
+		{
+			combat.reset();
+		}
 	}
 
 	/** Take a fresh baseline of XP and inventory so the next XP drop is measured correctly. */
@@ -213,12 +231,103 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 
 		final int gained = event.getXp() - previous;
-		if (gained <= 0 || (config.ignoreCombat() && COMBAT_SKILLS.contains(skill)))
+		if (gained <= 0)
+		{
+			return;
+		}
+
+		// Combat XP (and Magic while fighting) is counted per kill instead
+		if (combat.onXp(skill, gained, client.getTickCount()))
 		{
 			return;
 		}
 
 		pendingXp.merge(skill, gained, Integer::sum);
+	}
+
+	// ------------------------------------------------------------------
+	// Combat: kills -> XP per kill
+	// ------------------------------------------------------------------
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		if (event.getActor() instanceof NPC && event.getHitsplat().isMine())
+		{
+			combat.onMyHitsplat((NPC) event.getActor(), client.getTickCount());
+		}
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath event)
+	{
+		if (event.getActor() instanceof NPC)
+		{
+			combat.onNpcDeath((NPC) event.getActor(), client.getTickCount());
+		}
+	}
+
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
+	{
+		final NPC npc = event.getNpc();
+		if (npc.isDead())
+		{
+			// In case the death itself wasn't seen
+			combat.onNpcDeath(npc, client.getTickCount());
+		}
+		else
+		{
+			combat.onNpcDespawned(npc);
+		}
+	}
+
+	private void onKill(CombatTracker.Kill kill)
+	{
+		final Integer hp = combat.hitpoints(null, kill.name);
+		final Map<Skill, XpRate> rates = combat.rates(kill.name, hp, kill.style, kill.observed);
+		final List<XpRate> chatLines = new ArrayList<>();
+
+		// Tracked oldest-first, so the style's own skills end up on top of the overlay
+		if (config.showSlayer() && combat.gaveSlayerXp(kill.name))
+		{
+			final XpRate slayer = combat.slayerRate(kill.name, hp, combat.slayerNote(kill.name));
+			if (slayer != null)
+			{
+				trackKill(kill.name, slayer);
+				chatLines.add(slayer);
+			}
+		}
+
+		final XpRate hitpoints = rates.get(Skill.HITPOINTS);
+		if (hitpoints != null && config.showHitpoints())
+		{
+			trackKill(kill.name, hitpoints);
+		}
+
+		for (XpRate rate : rates.values())
+		{
+			if (rate.skill != Skill.HITPOINTS)
+			{
+				trackKill(kill.name, rate);
+				chatLines.add(0, rate);
+			}
+		}
+
+		if (config.chatOnXpDrop())
+		{
+			for (XpRate rate : chatLines)
+			{
+				sendChat(describeKills(kill.name, rate));
+			}
+		}
+	}
+
+	private void trackKill(String name, XpRate rate)
+	{
+		final TrackedAction action = track(rate.skill, name, rate.xp, 0);
+		action.perKill = true;
+		action.note = rate.note;
 	}
 
 	@Subscribe
@@ -290,6 +399,12 @@ public class ActionsToLevelPlugin extends Plugin
 			return;
 		}
 
+		final CombatTracker.Kill kill = combat.onTick(client.getTickCount());
+		if (kill != null && config.trackKills())
+		{
+			onKill(kill);
+		}
+
 		final Map<Integer, Integer> inventory = readInventory();
 		boolean waiting = false;
 
@@ -330,8 +445,10 @@ public class ActionsToLevelPlugin extends Plugin
 	{
 		final InventoryDiff.Change primary = pickPrimaryItem(skill, diff);
 		final String target = recentTarget();
+		final String alchemy = skill == Skill.MAGIC ? alchemyName(diff, xp) : null;
 
-		if (config.learnRates())
+		// Alching isn't "XP per coin", so don't learn from it
+		if (config.learnRates() && alchemy == null)
 		{
 			learnFrom(skill, xp, diff, primary, target);
 		}
@@ -340,7 +457,13 @@ public class ActionsToLevelPlugin extends Plugin
 		final double xpEach;
 		final int levelRequired;
 
-		if (primary != null)
+		if (alchemy != null)
+		{
+			name = alchemy;
+			xpEach = xp;
+			levelRequired = 0;
+		}
+		else if (primary != null)
 		{
 			final XpTable.Entry base = xpTable.forItem(primary.itemId, skill);
 			name = itemName(primary.itemId);
@@ -379,6 +502,26 @@ public class ActionsToLevelPlugin extends Plugin
 		{
 			sendChat(describe(action.name, null, skill, xpEach, levelRequired, false));
 		}
+	}
+
+	/** Alching turns an item into coins using a nature rune; name it for what it is, not "Coins". */
+	private static String alchemyName(InventoryDiff diff, int xp)
+	{
+		boolean coins = false;
+		boolean nature = false;
+		for (InventoryDiff.Change c : diff.gained)
+		{
+			coins |= c.itemId == ItemID.COINS;
+		}
+		for (InventoryDiff.Change c : diff.lost)
+		{
+			nature |= c.itemId == ItemID.NATURERUNE;
+		}
+		if (!coins || !nature)
+		{
+			return null;
+		}
+		return xp >= 65 ? "High Level Alchemy" : "Low Level Alchemy";
 	}
 
 	/**
@@ -476,6 +619,8 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 		action.xpEach = xpEach;
 		action.levelRequired = levelRequired;
+		action.perKill = false;
+		action.note = null;
 		action.lastUpdated = Instant.now();
 		tracked.put(key, action);
 
@@ -571,13 +716,15 @@ public class ActionsToLevelPlugin extends Plugin
 					{
 						continue;
 					}
-					final String name = npcName(entry);
+					final NPC npc = entry.getNpc();
+					final String name = npc != null ? CombatTracker.npcName(npc) : npcName(entry);
 					if (name == null)
 					{
 						continue;
 					}
-					known = !ratesForTarget(name, true).isEmpty();
-					onClick = () -> report(name, ratesForTarget(name, true));
+					final boolean attackable = CombatTracker.isAttackable(npc);
+					known = attackable || !ratesForTarget(name, true).isEmpty();
+					onClick = () -> reportNpc(npc, name, attackable);
 					break;
 				}
 				case EXAMINE_ITEM_GROUND:
@@ -785,6 +932,112 @@ public class ActionsToLevelPlugin extends Plugin
 		{
 			sendChat(describe(name, rate.gives, rate.skill, rate.xp, rate.levelRequired, rate.measured));
 		}
+	}
+
+	/**
+	 * Right-click on an NPC: thieving/hunter/fishing-spot info plus, for monsters,
+	 * kills to level with your current attack style and kills to your next Slayer level.
+	 */
+	private void reportNpc(NPC npc, String name, boolean attackable)
+	{
+		final Map<Skill, XpRate> skilling = ratesForTarget(name, true);
+		for (XpRate rate : skilling.values())
+		{
+			sendChat(describe(name, rate.gives, rate.skill, rate.xp, rate.levelRequired, rate.measured));
+		}
+
+		if (!attackable)
+		{
+			if (skilling.isEmpty())
+			{
+				report(name, skilling);
+			}
+			return;
+		}
+
+		final CombatStyle style = combat.currentStyle();
+		final Integer hp = combat.hitpoints(npc, name);
+		final Map<Skill, XpRate> rates = combat.rates(name, hp, style, null);
+
+		final ChatMessageBuilder header = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT).append(name)
+			.append(ChatColorType.NORMAL).append(hp != null ? " (" + hp + " hitpoints)" : "");
+		if (!style.isKnown())
+		{
+			header.append(": couldn't read your attack style. Open the combat tab once and try again.");
+		}
+		else if (rates.isEmpty())
+		{
+			header.append(", " + style.displayName + ": hitpoints unknown. Kill one and the plugin will learn its XP.");
+		}
+		else
+		{
+			header.append(", " + style.displayName + ":");
+		}
+		sendChat(header.build());
+
+		// Style skills first, then Hitpoints
+		for (XpRate rate : rates.values())
+		{
+			if (rate.skill != Skill.HITPOINTS)
+			{
+				sendChat(describeKills(null, rate));
+			}
+		}
+		final XpRate hitpoints = rates.get(Skill.HITPOINTS);
+		if (hitpoints != null)
+		{
+			sendChat(describeKills(null, hitpoints));
+		}
+
+		if (config.showSlayer())
+		{
+			final XpRate slayer = combat.slayerRate(name, hp, combat.slayerNote(npc, name));
+			if (slayer != null)
+			{
+				sendChat(describeKills(null, slayer));
+			}
+		}
+	}
+
+	/** e.g. "Strength: 87 kills to 71 (600 xp each)" or "Abyssal demon: 87 kills to Strength 71 (...)" */
+	private String describeKills(String name, XpRate rate)
+	{
+		final Skill skill = rate.skill;
+		final LevelMath.Progress p = progressFor(skill, rate.xp);
+		final ChatMessageBuilder msg = new ChatMessageBuilder();
+		if (name != null)
+		{
+			msg.append(ChatColorType.HIGHLIGHT).append(name).append(ChatColorType.NORMAL).append(": ");
+		}
+		else
+		{
+			msg.append("  " + skill.getName() + ": ");
+		}
+
+		final String skillPart = name != null ? skill.getName() + " " : "";
+		if (p.isMaxed())
+		{
+			msg.append(name != null ? skill.getName() + " is maxed" : "maxed");
+		}
+		else if (p.actionsRemaining < 0)
+		{
+			msg.append(String.format(Locale.ROOT, "%,d xp to %s%d", p.xpRemaining, skillPart, p.targetLevel));
+		}
+		else
+		{
+			msg.append(ChatColorType.HIGHLIGHT)
+				.append(String.format(Locale.ROOT, "%,d %s", p.actionsRemaining, p.actionsRemaining == 1 ? "kill" : "kills"))
+				.append(ChatColorType.NORMAL)
+				.append(" to " + skillPart + p.targetLevel
+					+ " (" + xpFormat.format(rate.xp) + " xp each" + (rate.measured ? ", measured" : "") + ")");
+		}
+
+		if (rate.note != null)
+		{
+			msg.append(" - " + rate.note);
+		}
+		return msg.build();
 	}
 
 	/** e.g. "Iron ore: 112 more to Mining 42 (35 xp each)" */

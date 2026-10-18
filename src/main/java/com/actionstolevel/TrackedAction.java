@@ -4,7 +4,7 @@ import java.time.Instant;
 import net.runelite.api.Skill;
 
 /**
- * One line on the overlay: an item (or object/NPC) you've recently gained XP from.
+ * One line on the overlay: an item, object or monster you've recently gained XP from.
  * The "how many left" number is worked out fresh from your current XP each frame.
  */
 final class TrackedAction
@@ -13,6 +13,10 @@ final class TrackedAction
 	final String name;
 	double xpEach;
 	int levelRequired;
+	/** True when each action is a kill. */
+	boolean perKill;
+	/** Extra text for the second line, e.g. "85 left" on a Slayer task. */
+	String note;
 	Instant lastUpdated;
 
 	TrackedAction(Skill skill, String name)

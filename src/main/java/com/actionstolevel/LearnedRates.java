@@ -85,6 +85,37 @@ final class LearnedRates
 		dirty = true;
 	}
 
+	/**
+	 * Running average with no reset, for values that are noisy per sample but steady over
+	 * time, like combat XP per kill when several monsters die close together.
+	 */
+	void recordAverage(String key, Skill skill, double xp)
+	{
+		if (xp <= 0 || Double.isNaN(xp) || Double.isInfinite(xp))
+		{
+			return;
+		}
+
+		final EnumMap<Skill, Rate> bySkill = rates.computeIfAbsent(key, k -> new EnumMap<>(Skill.class));
+		final Rate rate = bySkill.get(skill);
+		if (rate == null)
+		{
+			bySkill.put(skill, new Rate(xp, 1));
+		}
+		else
+		{
+			rate.xpSum += xp;
+			rate.samples++;
+			if (rate.samples > MAX_SAMPLES)
+			{
+				final int keep = MAX_SAMPLES / 2;
+				rate.xpSum = rate.average() * keep;
+				rate.samples = keep;
+			}
+		}
+		dirty = true;
+	}
+
 	Map<Skill, Rate> get(String key)
 	{
 		final EnumMap<Skill, Rate> bySkill = rates.get(key);

@@ -34,3 +34,12 @@ Copyright (c) 2021, Jordan Atwood <nightfirecat@protonmail.com>
 All rights reserved.
 
 The full license text is reproduced at the top of that file.
+
+--------------------------------------------------------------------------------
+
+src/main/java/com/actionstolevel/CombatStyle.java follows the attack style
+detection in RuneLite's Attack Styles plugin, distributed under the BSD
+2-Clause License:
+
+Copyright (c) 2017, honeyhoney <https://github.com/honeyhoney>
+All rights reserved.

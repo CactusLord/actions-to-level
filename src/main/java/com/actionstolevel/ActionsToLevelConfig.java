@@ -35,9 +35,16 @@ public interface ActionsToLevelConfig extends Config
 	String goalSection = "goal";
 
 	@ConfigSection(
+		name = "Combat",
+		description = "Kills to level for monsters",
+		position = 3
+	)
+	String combatSection = "combat";
+
+	@ConfigSection(
 		name = "Tracking",
 		description = "How XP drops are matched to items",
-		position = 3
+		position = 4
 	)
 	String trackingSection = "tracking";
 
@@ -59,13 +66,13 @@ public interface ActionsToLevelConfig extends Config
 	@ConfigItem(
 		keyName = "maxEntries",
 		name = "Items shown",
-		description = "How many recent items/actions the overlay lists at once",
+		description = "How many recent items, actions or monsters the overlay lists at once",
 		position = 1,
 		section = displaySection
 	)
 	default int maxEntries()
 	{
-		return 3;
+		return 4;
 	}
 
 	@Range(max = 60)
@@ -123,7 +130,7 @@ public interface ActionsToLevelConfig extends Config
 	@ConfigItem(
 		keyName = "menuOnNpcs",
 		name = "On NPCs",
-		description = "Add 'Actions to level' when right-clicking NPCs such as fishing spots or pickpocket targets",
+		description = "Add 'Actions to level' when right-clicking NPCs such as monsters, fishing spots or pickpocket targets",
 		position = 2,
 		section = menuSection
 	)
@@ -183,12 +190,50 @@ public interface ActionsToLevelConfig extends Config
 		return false;
 	}
 
+	// ---- Combat ----
+
+	@ConfigItem(
+		keyName = "trackKills",
+		name = "Track kills",
+		description = "Count down the kills left to level when you kill monsters",
+		position = 0,
+		section = combatSection
+	)
+	default boolean trackKills()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showSlayer",
+		name = "Show Slayer",
+		description = "Show kills left for your next Slayer level (only counts while on task)",
+		position = 1,
+		section = combatSection
+	)
+	default boolean showSlayer()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showHitpoints",
+		name = "Show Hitpoints on overlay",
+		description = "Also list Hitpoints on the overlay. Right-click always shows it",
+		position = 2,
+		section = combatSection
+	)
+	default boolean showHitpoints()
+	{
+		return false;
+	}
+
 	// ---- Tracking ----
 
 	@ConfigItem(
 		keyName = "learnRates",
 		name = "Learn my real XP rates",
-		description = "Use the XP you actually get (outfit bonuses, altars, etc.) once it has been seen twice, instead of the base value",
+		description = "Use the XP you actually get (outfit bonuses, altars, monster XP bonuses, spell XP) once it has been seen twice, instead of the base value",
 		position = 0,
 		section = trackingSection
 	)
@@ -197,15 +242,5 @@ public interface ActionsToLevelConfig extends Config
 		return true;
 	}
 
-	@ConfigItem(
-		keyName = "ignoreCombat",
-		name = "Ignore combat XP",
-		description = "Don't track Attack, Strength, Defence, Ranged, Hitpoints and Slayer XP drops",
-		position = 1,
-		section = trackingSection
-	)
-	default boolean ignoreCombat()
-	{
-		return true;
-	}
+
 }
