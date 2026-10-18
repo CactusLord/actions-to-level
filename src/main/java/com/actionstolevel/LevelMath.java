@@ -60,6 +60,42 @@ final class LevelMath
 		return new Progress(currentLevel, target, xpRemaining, actionsFor(xpRemaining, xpPerAction));
 	}
 
+	/** Where a pile of XP would take you. */
+	static final class Projection
+	{
+		final int fromLevel;
+		final int toLevel;
+		/** XP into the reached level. */
+		final int spare;
+		/** XP still needed for the level after the reached one, or 0 at the cap. */
+		final int shortOfNext;
+
+		Projection(int fromLevel, int toLevel, int spare, int shortOfNext)
+		{
+			this.fromLevel = fromLevel;
+			this.toLevel = toLevel;
+			this.spare = spare;
+			this.shortOfNext = shortOfNext;
+		}
+
+		boolean levelsUp()
+		{
+			return toLevel > fromLevel;
+		}
+	}
+
+	static Projection project(int currentXp, double gainXp, boolean virtualLevels)
+	{
+		final int cap = virtualLevels ? Experience.MAX_VIRT_LEVEL : Experience.MAX_REAL_LEVEL;
+		final int xp = Math.max(0, currentXp);
+		final int from = Math.min(cap, Experience.getLevelForXp(xp));
+		final int newXp = (int) Math.min(Experience.MAX_SKILL_XP, xp + Math.max(0, gainXp));
+		final int to = Math.min(cap, Experience.getLevelForXp(newXp));
+		final int spare = newXp - Experience.getXpForLevel(to);
+		final int shortOfNext = to >= cap ? 0 : Experience.getXpForLevel(to + 1) - newXp;
+		return new Projection(from, to, spare, shortOfNext);
+	}
+
 	static int targetLevel(int currentLevel, int configuredGoal, boolean virtualLevels)
 	{
 		if (configuredGoal > currentLevel)

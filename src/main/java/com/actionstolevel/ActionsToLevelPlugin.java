@@ -1,17 +1,16 @@
 package com.actionstolevel;
 
 import com.google.inject.Provides;
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
+import java.awt.image.BufferedImage;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -19,6 +18,7 @@ import java.util.Set;
 import javax.inject.Inject;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.Experience;
 import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
@@ -31,6 +31,7 @@ import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
@@ -39,13 +40,14 @@ import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.chat.ChatColorType;
-import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.RuneScapeProfileChanged;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.game.NPCManager;
 import net.runelite.client.plugins.Plugin;
@@ -53,36 +55,33 @@ import net.runelite.client.plugins.PluginDependency;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.slayer.SlayerPlugin;
 import net.runelite.client.plugins.slayer.SlayerPluginService;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
 import net.runelite.client.util.Text;
+import net.runelite.http.api.item.ItemPrice;
 
 @PluginDescriptor(
 	name = "Actions To Level",
-	description = "Shows how many more items, actions or kills you need to level up",
-	tags = {"xp", "level", "skilling", "actions", "calculator", "goal", "kills", "combat", "slayer", "mining", "woodcutting", "fishing"}
+	description = "How many more items, actions or kills you need to level, what your goals need from your bank, and what's left to gather",
+	tags = {"xp", "level", "skilling", "actions", "calculator", "goal", "kills", "combat", "slayer", "ironman", "bank", "mining", "woodcutting", "fishing"}
 )
 @PluginDependency(SlayerPlugin.class)
 public class ActionsToLevelPlugin extends Plugin
 {
 	static final String MENU_OPTION = "Actions to level";
+	static final String GOAL_OPTION = "Add goal";
 
 	/** An XP drop is credited to the last clicked object/NPC for this many ticks (~5 minutes). */
 	private static final int TARGET_MEMORY_TICKS = 500;
 	/** Ignore the XP sync the server sends while logging in / hopping. */
 	private static final int LOGIN_GRACE_TICKS = 2;
 	private static final int SAVE_INTERVAL_TICKS = 100;
+	private static final int PANEL_REFRESH_TICKS = 5;
 	/** Don't learn from ticks where lots of different items moved (banking, etc.). */
 	private static final int MAX_ITEM_KINDS_TO_LEARN = 4;
-
-	/** "Raw shark" is cooked into "Shark", "Grimy ranarr weed" is cleaned into "Ranarr weed"... */
-	private static final String[][] PRODUCT_PREFIXES = {
-		{"raw ", Skill.COOKING.name()},
-		{"grimy ", Skill.HERBLORE.name()},
-		{"uncut ", Skill.CRAFTING.name()},
-	};
-	/** Skills whose named actions are the actual NPC/object you click. */
-	private static final Set<Skill> NAME_MATCHED_SKILLS = EnumSet.of(Skill.THIEVING, Skill.HUNTER);
-	private static final String[] ROCK_SUFFIXES = {" rocks", " rock", " crystals", " vein", " deposit"};
+	private static final int MAX_SEARCH_RESULTS = 8;
 
 	@Inject
 	private Client client;
@@ -109,6 +108,9 @@ public class ActionsToLevelPlugin extends Plugin
 	private ActionsToLevelOverlay overlay;
 
 	@Inject
+	private HoverOverlay hoverOverlay;
+
+	@Inject
 	private XpTable xpTable;
 
 	@Inject
@@ -117,13 +119,27 @@ public class ActionsToLevelPlugin extends Plugin
 	@Inject
 	private SlayerPluginService slayerService;
 
+	@Inject
+	private Notifier notifier;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
 	private final LearnedRates learned = new LearnedRates();
+	private final RecipeBook recipes = new RecipeBook();
 	private CombatTracker combat;
+	private Rates rates;
+	private BankTracker bank;
+	private Goals goals;
+	private Reports reports;
+	private ActionsToLevelPanel panel;
+	private NavigationButton navButton;
+
 	private final Map<Skill, Integer> lastXp = new EnumMap<>(Skill.class);
 	private final Map<Skill, Integer> pendingXp = new EnumMap<>(Skill.class);
 	/** Most recently updated entry last. Only touched on the client thread. */
 	private final LinkedHashMap<String, TrackedAction> tracked = new LinkedHashMap<>();
-	private final DecimalFormat xpFormat = new DecimalFormat("#,##0.##", DecimalFormatSymbols.getInstance(Locale.ROOT));
+	private List<Reports.GoalView> overlayGoals = Collections.emptyList();
 
 	/** Item id -> quantity at the end of the last processed tick, or null when unknown. */
 	private Map<Integer, Integer> inventorySnapshot;
@@ -132,6 +148,7 @@ public class ActionsToLevelPlugin extends Plugin
 	private String lastTarget;
 	private int lastTargetTick;
 	private int ticksSinceSave;
+	private int ticksSincePanel;
 
 	@Provides
 	ActionsToLevelConfig provideConfig(ConfigManager configManager)
@@ -143,9 +160,18 @@ public class ActionsToLevelPlugin extends Plugin
 	protected void startUp()
 	{
 		learned.deserialize(configManager.getConfiguration(ActionsToLevelConfig.GROUP, ActionsToLevelConfig.LEARNED_RATES_KEY));
+		recipes.deserialize(configManager.getConfiguration(ActionsToLevelConfig.GROUP, RecipeBook.RECIPES_KEY));
 		combat = new CombatTracker(client, npcManager, slayerService, learned);
+		combat.deserializeMonsters(configManager.getConfiguration(ActionsToLevelConfig.GROUP, ActionsToLevelConfig.MONSTERS_KEY));
+		rates = new Rates(xpTable, learned, recipes, itemManager, config);
+		bank = new BankTracker(client, itemManager, configManager);
+		goals = new Goals(configManager);
+		reports = new Reports(client, config, rates, combat, bank, this::findTracked);
+
 		overlayManager.add(overlay);
+		overlayManager.add(hoverOverlay);
 		resetSession();
+		buildPanel();
 
 		if (client.getGameState() == GameState.LOGGED_IN)
 		{
@@ -156,10 +182,20 @@ public class ActionsToLevelPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
-		saveLearned();
+		saveAll();
+		bank.reset();
+		goals.reset();
 		overlayManager.remove(overlay);
+		overlayManager.remove(hoverOverlay);
+		removePanel();
 		tracked.clear();
+		overlayGoals = Collections.emptyList();
 		resetSession();
+	}
+
+	Reports reports()
+	{
+		return reports;
 	}
 
 	private void resetSession()
@@ -193,10 +229,14 @@ public class ActionsToLevelPlugin extends Plugin
 		pendingWaitedATick = false;
 		inventorySnapshot = readInventory();
 		xpTable.buildNameIndex(itemManager);
+		bank.ensureLoaded();
+		goals.ensureLoaded();
+		refreshGoals();
+		refreshPanel();
 	}
 
 	// ------------------------------------------------------------------
-	// Automatic tracking: XP drop -> which item / object caused it
+	// Events
 	// ------------------------------------------------------------------
 
 	@Subscribe
@@ -210,13 +250,50 @@ public class ActionsToLevelPlugin extends Plugin
 				loginGraceTicks = LOGIN_GRACE_TICKS;
 				break;
 			case LOGIN_SCREEN:
-				saveLearned();
+				saveAll();
 				resetSession();
 				tracked.clear();
+				bank.reset();
+				goals.reset();
+				overlayGoals = Collections.emptyList();
 				break;
 			default:
 				break;
 		}
+	}
+
+	@Subscribe
+	public void onRuneScapeProfileChanged(RuneScapeProfileChanged event)
+	{
+		// A different account: its own bank and goals
+		clientThread.invokeLater(() ->
+		{
+			bank.reset();
+			goals.reset();
+			bank.ensureLoaded();
+			goals.ensureLoaded();
+			refreshGoals();
+			refreshPanel();
+		});
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!ActionsToLevelConfig.GROUP.equals(event.getGroup()))
+		{
+			return;
+		}
+		if ("showPanel".equals(event.getKey()))
+		{
+			removePanel();
+			buildPanel();
+		}
+		clientThread.invokeLater(() ->
+		{
+			refreshGoals();
+			refreshPanel();
+		});
 	}
 
 	@Subscribe
@@ -236,6 +313,13 @@ public class ActionsToLevelPlugin extends Plugin
 			return;
 		}
 
+		final int oldLevel = Experience.getLevelForXp(previous);
+		final int newLevel = Experience.getLevelForXp(event.getXp());
+		if (newLevel > oldLevel)
+		{
+			onLevelUp(skill, newLevel);
+		}
+
 		// Combat XP (and Magic while fighting) is counted per kill instead
 		if (combat.onXp(skill, gained, client.getTickCount()))
 		{
@@ -244,10 +328,6 @@ public class ActionsToLevelPlugin extends Plugin
 
 		pendingXp.merge(skill, gained, Integer::sum);
 	}
-
-	// ------------------------------------------------------------------
-	// Combat: kills -> XP per kill
-	// ------------------------------------------------------------------
 
 	@Subscribe
 	public void onHitsplatApplied(HitsplatApplied event)
@@ -282,52 +362,10 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 	}
 
-	private void onKill(CombatTracker.Kill kill)
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event)
 	{
-		final Integer hp = combat.hitpoints(null, kill.name);
-		final Map<Skill, XpRate> rates = combat.rates(kill.name, hp, kill.style, kill.observed);
-		final List<XpRate> chatLines = new ArrayList<>();
-
-		// Tracked oldest-first, so the style's own skills end up on top of the overlay
-		if (config.showSlayer() && combat.gaveSlayerXp(kill.name))
-		{
-			final XpRate slayer = combat.slayerRate(kill.name, hp, combat.slayerNote(kill.name));
-			if (slayer != null)
-			{
-				trackKill(kill.name, slayer);
-				chatLines.add(slayer);
-			}
-		}
-
-		final XpRate hitpoints = rates.get(Skill.HITPOINTS);
-		if (hitpoints != null && config.showHitpoints())
-		{
-			trackKill(kill.name, hitpoints);
-		}
-
-		for (XpRate rate : rates.values())
-		{
-			if (rate.skill != Skill.HITPOINTS)
-			{
-				trackKill(kill.name, rate);
-				chatLines.add(0, rate);
-			}
-		}
-
-		if (config.chatOnXpDrop())
-		{
-			for (XpRate rate : chatLines)
-			{
-				sendChat(describeKills(kill.name, rate));
-			}
-		}
-	}
-
-	private void trackKill(String name, XpRate rate)
-	{
-		final TrackedAction action = track(rate.skill, name, rate.xp, 0);
-		action.perKill = true;
-		action.note = rate.note;
+		bank.onContainerChanged(event.getContainerId(), event.getItemContainer());
 	}
 
 	@Subscribe
@@ -367,24 +405,6 @@ public class ActionsToLevelPlugin extends Plugin
 			default:
 				break;
 		}
-	}
-
-	private void rememberTarget(String name)
-	{
-		if (name != null)
-		{
-			lastTarget = name;
-			lastTargetTick = client.getTickCount();
-		}
-	}
-
-	private String recentTarget()
-	{
-		if (lastTarget == null || client.getTickCount() - lastTargetTick > TARGET_MEMORY_TICKS)
-		{
-			return null;
-		}
-		return lastTarget;
 	}
 
 	@Subscribe
@@ -434,12 +454,28 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 
 		expireTracked();
+		checkAlmostThere();
+		bank.onTick();
 
-		if (learned.isDirty() && ++ticksSinceSave >= SAVE_INTERVAL_TICKS)
+		if (++ticksSincePanel >= PANEL_REFRESH_TICKS)
 		{
-			saveLearned();
+			ticksSincePanel = 0;
+			refreshGoals();
+			if (panel != null && panel.isShowing())
+			{
+				refreshPanel();
+			}
+		}
+
+		if (++ticksSinceSave >= SAVE_INTERVAL_TICKS)
+		{
+			saveAll();
 		}
 	}
+
+	// ------------------------------------------------------------------
+	// Skilling: XP drop -> which item / object caused it
+	// ------------------------------------------------------------------
 
 	private void onXpDrop(Skill skill, int xp, InventoryDiff diff)
 	{
@@ -451,6 +487,7 @@ public class ActionsToLevelPlugin extends Plugin
 		if (config.learnRates() && alchemy == null)
 		{
 			learnFrom(skill, xp, diff, primary, target);
+			recipes.learn(skill, diff, primary);
 		}
 
 		final String name;
@@ -466,13 +503,13 @@ public class ActionsToLevelPlugin extends Plugin
 		else if (primary != null)
 		{
 			final XpTable.Entry base = xpTable.forItem(primary.itemId, skill);
-			name = itemName(primary.itemId);
-			xpEach = bestRate(LearnedRates.itemKey(primary.itemId), skill, base, (double) xp / primary.quantity);
+			name = rates.itemName(primary.itemId);
+			xpEach = rates.bestRate(LearnedRates.itemKey(primary.itemId), skill, base, (double) xp / primary.quantity);
 			levelRequired = base != null ? base.level : 0;
 		}
 		else if (target != null)
 		{
-			final XpRate base = ratesForTarget(target, false).get(skill);
+			final XpRate base = rates.forTarget(target, false).get(skill);
 			// "Iron rocks" with a full inventory still counts as Iron ore, so it shares the same overlay line
 			name = base != null && base.gives != null ? base.gives : target;
 			final LearnedRates.Rate rate = config.learnRates() ? learned.get(LearnedRates.targetKey(target), skill) : null;
@@ -498,9 +535,10 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 
 		final TrackedAction action = track(skill, name, xpEach, levelRequired);
+		action.recordActions(System.currentTimeMillis(), Math.max(1, (int) Math.round(xp / Math.max(0.01, xpEach))), xp);
 		if (config.chatOnXpDrop())
 		{
-			sendChat(describe(action.name, null, skill, xpEach, levelRequired, false));
+			sendChat(reports.countLine(action.name, new XpRate(skill, xpEach, levelRequired, false, null)).chat());
 		}
 	}
 
@@ -591,23 +629,80 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 	}
 
-	private double bestRate(String key, Skill skill, XpTable.Entry base, double observed)
+	private void rememberTarget(String name)
 	{
-		final LearnedRates.Rate rate = config.learnRates() ? learned.get(key, skill) : null;
-		if (rate != null && rate.samples >= 2)
+		if (name != null)
 		{
-			return rate.average();
+			lastTarget = name;
+			lastTargetTick = client.getTickCount();
 		}
-		if (base != null)
-		{
-			return base.xp;
-		}
-		if (rate != null)
-		{
-			return rate.average();
-		}
-		return observed;
 	}
+
+	private String recentTarget()
+	{
+		if (lastTarget == null || client.getTickCount() - lastTargetTick > TARGET_MEMORY_TICKS)
+		{
+			return null;
+		}
+		return lastTarget;
+	}
+
+	// ------------------------------------------------------------------
+	// Combat: kills -> XP per kill
+	// ------------------------------------------------------------------
+
+	private void onKill(CombatTracker.Kill kill)
+	{
+		final Integer hp = combat.hitpoints(null, kill.name);
+		final Map<Skill, XpRate> killRates = combat.rates(kill.name, hp, kill.style, kill.observed);
+		final List<XpRate> chatLines = new ArrayList<>();
+
+		// Tracked oldest-first, so the style's own skills end up on top of the overlay
+		if (config.showSlayer() && combat.gaveSlayerXp(kill.name))
+		{
+			final XpRate slayer = combat.slayerRate(kill.name, hp, combat.slayerNote(kill.name));
+			if (slayer != null)
+			{
+				trackKill(kill, slayer);
+				chatLines.add(slayer);
+			}
+		}
+
+		final XpRate hitpoints = killRates.get(Skill.HITPOINTS);
+		if (hitpoints != null && config.showHitpoints())
+		{
+			trackKill(kill, hitpoints);
+		}
+
+		for (XpRate rate : killRates.values())
+		{
+			if (rate.skill != Skill.HITPOINTS)
+			{
+				trackKill(kill, rate);
+				chatLines.add(0, rate);
+			}
+		}
+
+		if (config.chatOnXpDrop())
+		{
+			for (XpRate rate : chatLines)
+			{
+				sendChat(reports.killLine(kill.name, rate, true).chat());
+			}
+		}
+	}
+
+	private void trackKill(CombatTracker.Kill kill, XpRate rate)
+	{
+		final TrackedAction action = track(rate.skill, kill.name, rate.xp, 0);
+		action.perKill = true;
+		action.note = rate.note;
+		action.recordActions(System.currentTimeMillis(), kill.count, rate.xp * kill.count);
+	}
+
+	// ------------------------------------------------------------------
+	// Overlay lines, pace and alerts
+	// ------------------------------------------------------------------
 
 	private TrackedAction track(Skill skill, String name, double xpEach, int levelRequired)
 	{
@@ -633,6 +728,12 @@ public class ActionsToLevelPlugin extends Plugin
 		return action;
 	}
 
+	/** The overlay line for a skill and name, if there is one (used for pace). */
+	TrackedAction findTracked(Skill skill, String name)
+	{
+		return name == null ? null : tracked.get(TrackedAction.key(skill, name));
+	}
+
 	private void expireTracked()
 	{
 		final int minutes = config.overlayTimeout();
@@ -642,6 +743,47 @@ public class ActionsToLevelPlugin extends Plugin
 		}
 		final Instant cutoff = Instant.now().minus(Duration.ofMinutes(minutes));
 		tracked.values().removeIf(a -> a.lastUpdated.isBefore(cutoff));
+	}
+
+	/** "10 Iron ore left to Mining 42" once per level per thing you're doing. */
+	private void checkAlmostThere()
+	{
+		final int threshold = Math.max(1, config.alertAt());
+		for (TrackedAction a : tracked.values())
+		{
+			final LevelMath.Progress p = progressFor(a.skill, a.xpEach);
+			if (p.isMaxed() || p.actionsRemaining < 0 || p.actionsRemaining > threshold || a.alertedForLevel == p.targetLevel)
+			{
+				continue;
+			}
+			a.alertedForLevel = p.targetLevel;
+			final String what = a.perKill ? (p.actionsRemaining == 1 ? "kill" : "kills") + " of " + a.name : a.name;
+			notifier.notify(config.nearLevelNotification(),
+				p.actionsRemaining + " " + what + " left to " + a.skill.getName() + " " + p.targetLevel);
+		}
+	}
+
+	private void onLevelUp(Skill skill, int level)
+	{
+		if (config.unlockMessages() && level <= Experience.MAX_REAL_LEVEL)
+		{
+			xpTable.buildNameIndex(itemManager);
+			for (Line line : reports.levelUp(skill, level, xpTable))
+			{
+				sendChat(line.chat());
+			}
+		}
+
+		for (Goals.Goal g : goals.all())
+		{
+			if (!g.reached && g.skill == skill && level >= g.targetLevel)
+			{
+				goals.markReached(g);
+				final String msg = "Goal reached: " + skill.getName() + " " + g.targetLevel + " (" + g.name + ")";
+				notifier.notify(config.goalNotification(), msg);
+				sendChat(Line.main().strong(msg).chat());
+			}
+		}
 	}
 
 	/** Newest first, limited to the configured count. Used by the overlay. */
@@ -664,17 +806,48 @@ public class ActionsToLevelPlugin extends Plugin
 
 	LevelMath.Progress progressFor(Skill skill, double xpEach)
 	{
-		return LevelMath.progress(client.getSkillExperience(skill), config.targetLevel(), config.virtualLevels(), xpEach);
+		return reports.progressFor(skill, xpEach);
+	}
+
+	String formatXp(double xp)
+	{
+		return reports.formatXp(xp);
+	}
+
+	/** Goals for the overlay, worked out on the game tick rather than every frame. */
+	List<Reports.GoalView> overlayGoals()
+	{
+		return overlayGoals;
+	}
+
+	private void refreshGoals()
+	{
+		if (client.getGameState() != GameState.LOGGED_IN || !config.showGoalsOnOverlay())
+		{
+			overlayGoals = Collections.emptyList();
+			return;
+		}
+		final List<Reports.GoalView> views = new ArrayList<>();
+		for (Goals.Goal g : goals.all())
+		{
+			if (views.size() >= config.goalsOnOverlay())
+			{
+				break;
+			}
+			views.add(reports.goal(g));
+		}
+		overlayGoals = views;
 	}
 
 	// ------------------------------------------------------------------
-	// Right-click "Actions to level"
+	// Right-click "Actions to level" / "Add goal"
 	// ------------------------------------------------------------------
 
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		if (config.requireShift() && !client.isKeyPressed(KeyCode.KC_SHIFT))
+		final boolean shift = client.isKeyPressed(KeyCode.KC_SHIFT);
+		if (config.requireShift() && !shift)
 		{
 			return;
 		}
@@ -691,6 +864,7 @@ public class ActionsToLevelPlugin extends Plugin
 			}
 
 			final Runnable onClick;
+			final Runnable onGoal;
 			final boolean known;
 
 			switch (entry.getType())
@@ -706,8 +880,10 @@ public class ActionsToLevelPlugin extends Plugin
 					{
 						continue;
 					}
-					known = !ratesForTarget(name, true).isEmpty();
-					onClick = () -> report(name, ratesForTarget(name, true));
+					final Map<Skill, XpRate> r = rates.forTarget(name, true);
+					known = !r.isEmpty();
+					onClick = () -> sendLines(reports.object(name, false));
+					onGoal = () -> addGoalsFromMenu(r, Goals.Goal.Kind.ACTION, -1, name);
 					break;
 				}
 				case EXAMINE_NPC:
@@ -723,8 +899,9 @@ public class ActionsToLevelPlugin extends Plugin
 						continue;
 					}
 					final boolean attackable = CombatTracker.isAttackable(npc);
-					known = attackable || !ratesForTarget(name, true).isEmpty();
-					onClick = () -> reportNpc(npc, name, attackable);
+					known = attackable || !rates.forTarget(name, true).isEmpty();
+					onClick = () -> sendLines(reports.npc(npc, name, attackable, false));
+					onGoal = () -> addNpcGoalsFromMenu(npc, name, attackable);
 					break;
 				}
 				case EXAMINE_ITEM_GROUND:
@@ -740,8 +917,10 @@ public class ActionsToLevelPlugin extends Plugin
 					{
 						continue;
 					}
-					known = !ratesForItem(itemId).isEmpty();
-					onClick = () -> report(itemName(itemId), ratesForItem(itemId));
+					final Map<Skill, XpRate> r = rates.forItem(itemId);
+					known = !r.isEmpty();
+					onClick = () -> sendLines(reports.item(itemId, false));
+					onGoal = () -> addGoalsFromMenu(r, Goals.Goal.Kind.ITEM, itemId, rates.itemName(itemId));
 					break;
 				}
 				default:
@@ -753,13 +932,69 @@ public class ActionsToLevelPlugin extends Plugin
 				continue;
 			}
 
-			// Inserting at the Examine entry's index puts our option directly below Examine
+			// Inserting at the Examine entry's index puts our options directly below Examine
+			if (shift && config.goalMenuOption() && known)
+			{
+				client.getMenu().createMenuEntry(idx)
+					.setOption(GOAL_OPTION)
+					.setTarget(entry.getTarget())
+					.setType(MenuAction.RUNELITE)
+					.onClick(e -> onGoal.run());
+			}
 			client.getMenu().createMenuEntry(idx)
 				.setOption(MENU_OPTION)
 				.setTarget(entry.getTarget())
 				.setType(MenuAction.RUNELITE)
 				.onClick(e -> onClick.run());
 		}
+	}
+
+	private void addGoalsFromMenu(Map<Skill, XpRate> skillRates, Goals.Goal.Kind kind, int itemId, String name)
+	{
+		for (Skill skill : skillRates.keySet())
+		{
+			addGoal(skill, kind, itemId, name, 0);
+		}
+	}
+
+	private void addNpcGoalsFromMenu(NPC npc, String name, boolean attackable)
+	{
+		final Map<Skill, XpRate> skilling = rates.forTarget(name, true);
+		for (Skill skill : skilling.keySet())
+		{
+			addGoal(skill, Goals.Goal.Kind.ACTION, -1, name, 0);
+		}
+		if (!attackable)
+		{
+			return;
+		}
+		final Integer hp = combat.hitpoints(npc, name);
+		for (Skill skill : combat.rates(name, hp, combat.currentStyle(), null).keySet())
+		{
+			if (skill != Skill.HITPOINTS)
+			{
+				addGoal(skill, Goals.Goal.Kind.MONSTER, -1, name, 0);
+			}
+		}
+		if (config.showSlayer() && combat.remainingOnTask() > 0)
+		{
+			addGoal(Skill.SLAYER, Goals.Goal.Kind.MONSTER, -1, name, 0);
+		}
+	}
+
+	/** @param target goal level, or 0 for the "Count to level" setting or else the next level */
+	private void addGoal(Skill skill, Goals.Goal.Kind kind, int itemId, String name, int target)
+	{
+		final int current = Experience.getLevelForXp(client.getSkillExperience(skill));
+		int level = target > current ? target : LevelMath.targetLevel(current, config.targetLevel(), true);
+		if (level < 0)
+		{
+			level = Experience.MAX_VIRT_LEVEL;
+		}
+		goals.add(skill, kind, itemId, name, level);
+		sendChat(Line.main().text("Goal added: ").strong(skill.getName() + " " + level).text(" (" + name + ")").chat());
+		refreshGoals();
+		refreshPanel();
 	}
 
 	private int itemIdOf(MenuEntry entry)
@@ -778,303 +1013,280 @@ public class ActionsToLevelPlugin extends Plugin
 		return itemId > 0 ? itemManager.canonicalize(itemId) : -1;
 	}
 
-	/** Every skill this item gives XP in. */
-	private Map<Skill, XpRate> ratesForItem(int itemId)
+	// ------------------------------------------------------------------
+	// Side panel
+	// ------------------------------------------------------------------
+
+	private void buildPanel()
 	{
-		final Map<Skill, XpRate> rates = new EnumMap<>(Skill.class);
-		for (XpTable.Entry e : xpTable.forItem(itemId).values())
+		if (!config.showPanel() || navButton != null)
 		{
-			rates.put(e.skill, new XpRate(e.skill, e.xp, e.level, false, null));
+			return;
+		}
+		panel = new ActionsToLevelPanel();
+		panel.setCallbacks(
+			query -> clientThread.invokeLater(this::refreshPanel),
+			(spec, target) -> clientThread.invokeLater(() -> addGoal(spec.skill, spec.kind, spec.itemId, spec.name, target)),
+			id -> clientThread.invokeLater(() ->
+			{
+				goals.remove(id);
+				refreshGoals();
+				refreshPanel();
+			}),
+			(id, target) -> clientThread.invokeLater(() ->
+			{
+				goals.setTarget(id, target);
+				refreshGoals();
+				refreshPanel();
+			}));
+
+		BufferedImage icon;
+		try
+		{
+			icon = ImageUtil.loadImageResource(ActionsToLevelPlugin.class, "panel_icon.png");
+		}
+		catch (RuntimeException e)
+		{
+			icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+		}
+		navButton = NavigationButton.builder()
+			.tooltip("Actions To Level")
+			.icon(icon)
+			.priority(7)
+			.panel(panel)
+			.build();
+		clientToolbar.addNavigation(navButton);
+	}
+
+	private void removePanel()
+	{
+		if (navButton != null)
+		{
+			clientToolbar.removeNavigation(navButton);
+			navButton = null;
+		}
+		panel = null;
+	}
+
+	/** Rebuild the panel's contents. Client thread only. */
+	private void refreshPanel()
+	{
+		if (panel == null || client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+		xpTable.buildNameIndex(itemManager);
+
+		final ActionsToLevelPanel.Data data = new ActionsToLevelPanel.Data();
+		data.query = panel.query();
+		data.results = search(data.query);
+
+		final List<ActionsToLevelPanel.Card> goalCards = new ArrayList<>();
+		final List<Reports.GoalView> views = new ArrayList<>();
+		for (Goals.Goal g : goals.all())
+		{
+			final Reports.GoalView v = reports.goal(g);
+			views.add(v);
+			goalCards.add(new ActionsToLevelPanel.Card(v.title, v.lines, Collections.emptyList(), g.id, g.targetLevel, v.reached));
+		}
+		data.goals = goalCards;
+
+		final List<Line> gather = new ArrayList<>();
+		for (Reports.Material m : reports.gatherList(views))
+		{
+			gather.add(Line.main().strong(m.name).text(": " + Reports.fmt(m.missing) + (m.source != null ? " (" + m.source + ")" : "")));
+		}
+		data.gather = gather;
+		data.slayer = slayerLines();
+		data.session = sessionLines();
+		panel.update(data);
+	}
+
+	private List<ActionsToLevelPanel.Card> search(String query)
+	{
+		final String q = query.toLowerCase(Locale.ROOT);
+		if (q.length() < 2)
+		{
+			return Collections.emptyList();
 		}
 
-		// Raw fish -> cooking, grimy herbs -> cleaning, uncut gems -> cutting
-		final String lower = itemName(itemId).toLowerCase(Locale.ROOT);
-		for (String[] prefix : PRODUCT_PREFIXES)
+		final List<ActionsToLevelPanel.Card> cards = new ArrayList<>();
+		final Set<Integer> items = new LinkedHashSet<>();
+		final Set<String> actions = new LinkedHashSet<>();
+
+		// Your bank first: that's what an ironman has to work with
+		for (int id : bank.bankItemIds())
 		{
-			if (!lower.startsWith(prefix[0]))
+			if (rates.itemName(id).toLowerCase(Locale.ROOT).contains(q))
+			{
+				items.add(id);
+			}
+		}
+		for (XpTable.Entry e : xpTable.named())
+		{
+			if (e.name.contains(q))
+			{
+				if (e.isNamedAction())
+				{
+					actions.add(e.displayName);
+				}
+				else
+				{
+					items.add(e.itemId);
+				}
+			}
+		}
+		for (ItemPrice price : rates.searchItems(q))
+		{
+			if (items.size() >= MAX_SEARCH_RESULTS * 2)
+			{
+				break;
+			}
+			items.add(price.getId());
+		}
+
+		for (Map.Entry<String, Integer> m : combat.seenMonsters().entrySet())
+		{
+			if (cards.size() >= MAX_SEARCH_RESULTS)
+			{
+				break;
+			}
+			if (!m.getKey().toLowerCase(Locale.ROOT).contains(q))
 			{
 				continue;
 			}
-			final Skill skill = Skill.valueOf(prefix[1]);
-			for (XpTable.Entry e : xpTable.forName(lower.substring(prefix[0].length())))
+			final List<ActionsToLevelPanel.GoalSpec> specs = new ArrayList<>();
+			final Map<Skill, XpRate> combatRates = combat.rates(m.getKey(), m.getValue(), combat.currentStyle(), null);
+			for (Skill skill : combatRates.keySet())
 			{
-				if (e.skill == skill)
-				{
-					rates.putIfAbsent(skill, new XpRate(skill, e.xp, e.level, false, null));
-					break;
-				}
+				specs.add(new ActionsToLevelPanel.GoalSpec(skill, Goals.Goal.Kind.MONSTER, -1, m.getKey()));
 			}
+			specs.add(new ActionsToLevelPanel.GoalSpec(Skill.SLAYER, Goals.Goal.Kind.MONSTER, -1, m.getKey()));
+			cards.add(ActionsToLevelPanel.Card.info(m.getKey(), reports.npc(null, m.getKey(), true, false), specs));
 		}
 
-		mergeLearned(LearnedRates.itemKey(itemId), rates);
-		return rates;
+		for (int id : items)
+		{
+			if (cards.size() >= MAX_SEARCH_RESULTS)
+			{
+				break;
+			}
+			final Map<Skill, XpRate> r = rates.forItem(id);
+			if (r.isEmpty())
+			{
+				continue;
+			}
+			final String name = rates.itemName(id);
+			final List<ActionsToLevelPanel.GoalSpec> specs = new ArrayList<>();
+			for (Skill skill : r.keySet())
+			{
+				specs.add(new ActionsToLevelPanel.GoalSpec(skill, Goals.Goal.Kind.ITEM, id, name));
+			}
+			cards.add(ActionsToLevelPanel.Card.info(name, reports.item(id, false), specs));
+		}
+
+		for (String name : actions)
+		{
+			if (cards.size() >= MAX_SEARCH_RESULTS)
+			{
+				break;
+			}
+			final Map<Skill, XpRate> r = rates.forTarget(name, true);
+			final List<Line> lines = new ArrayList<>();
+			final List<ActionsToLevelPanel.GoalSpec> specs = new ArrayList<>();
+			for (XpRate rate : r.values())
+			{
+				lines.add(reports.countLine(name, rate));
+				specs.add(new ActionsToLevelPanel.GoalSpec(rate.skill, Goals.Goal.Kind.ACTION, -1, name));
+			}
+			if (lines.isEmpty())
+			{
+				// Agility courses, farming patches, construction builds: not tied to a clickable name
+				for (XpTable.Entry e : xpTable.forName(name))
+				{
+					final XpRate rate = new XpRate(e.skill, e.xp, e.level, false, null);
+					lines.add(reports.countLine(name, rate));
+					specs.add(new ActionsToLevelPanel.GoalSpec(e.skill, Goals.Goal.Kind.ACTION, -1, name));
+				}
+			}
+			if (!lines.isEmpty())
+			{
+				cards.add(ActionsToLevelPanel.Card.info(name, lines, specs));
+			}
+		}
+		return cards;
 	}
 
-	/** Every skill an object or NPC (rock, tree, fishing spot, stall, pickpocket target) gives XP in. */
-	private Map<Skill, XpRate> ratesForTarget(String name, boolean includeLearned)
+	private List<Line> slayerLines()
 	{
-		final Map<Skill, XpRate> rates = new EnumMap<>(Skill.class);
-		final String lower = name.toLowerCase(Locale.ROOT);
-
-		// Pickpocket targets, stalls and hunter creatures listed by name. Farming/construction names like
-		// "Yew tree" are patch/house builds, not the wild object, so those are left to learning.
-		for (XpTable.Entry e : xpTable.forName(lower))
+		final int remaining = combat.remainingOnTask();
+		if (remaining <= 0)
 		{
-			if (e.isNamedAction() && NAME_MATCHED_SKILLS.contains(e.skill))
-			{
-				rates.putIfAbsent(e.skill, new XpRate(e.skill, e.xp, e.level, false, null));
-			}
+			return Collections.emptyList();
 		}
-
-		// "Iron rocks" -> Iron ore, "Gem rocks", "Amethyst crystals"...
-		for (String suffix : ROCK_SUFFIXES)
+		final List<Line> lines = new ArrayList<>();
+		String task = null;
+		try
 		{
-			if (lower.endsWith(suffix) && lower.length() > suffix.length())
+			task = slayerService.getTask();
+		}
+		catch (RuntimeException ignored)
+		{
+			// Slayer plugin off
+		}
+		lines.add(Line.main().strong(task != null ? task : "Current task").text(": " + Reports.fmt(remaining) + " left"));
+
+		for (TrackedAction a : tracked.values())
+		{
+			if (a.skill == Skill.SLAYER)
 			{
-				XpTable.Entry ore = firstOfSkill(xpTable.forName(lower), Skill.MINING);
-				if (ore == null)
-				{
-					ore = xpTable.findByPrefix(Skill.MINING, lower.substring(0, lower.length() - suffix.length()));
-				}
-				addGives(rates, ore, name);
+				final LevelMath.Projection pr = LevelMath.project(client.getSkillExperience(Skill.SLAYER), remaining * a.xpEach, config.virtualLevels());
+				lines.add(Line.detail().text("Finishing it (" + a.name + ", " + reports.formatXp(a.xpEach) + " xp each): Slayer "
+					+ (pr.levelsUp() ? "to " + pr.toLevel : "stays " + pr.toLevel) + ", " + Reports.fmt(pr.shortOfNext) + " xp short of " + (pr.toLevel + 1)));
 				break;
 			}
 		}
+		return lines;
+	}
 
-		// "Yew tree" -> Yew logs, plain "Tree" -> Logs
-		if (lower.equals("tree") || lower.endsWith(" tree"))
+	private List<Line> sessionLines()
+	{
+		final long now = System.currentTimeMillis();
+		final List<Line> lines = new ArrayList<>();
+		for (TrackedAction a : getTrackedNewestFirst())
 		{
-			final String kind = lower.equals("tree") ? "" : lower.substring(0, lower.length() - " tree".length());
-			XpTable.Entry logs = kind.isEmpty() ? null : xpTable.findByPrefix(Skill.WOODCUTTING, kind + " logs");
-			if (logs == null && !kind.isEmpty())
+			final LevelMath.Progress p = progressFor(a.skill, a.xpEach);
+			final Line l = Line.main().strong(a.name).text(" (" + a.skill.getName() + "): " + Reports.fmt(a.sessionCount)
+				+ (a.perKill ? " kills" : " done"));
+			final double perHour = a.perHour(now);
+			if (perHour > 0)
 			{
-				logs = xpTable.findByPrefix(Skill.WOODCUTTING, kind);
+				l.text(", " + Reports.fmt(Math.round(perHour)) + "/h");
 			}
-			if (logs == null)
+			if (p.actionsRemaining >= 0 && !p.isMaxed())
 			{
-				// Regular, dead, evergreen and jungle trees all give normal logs
-				logs = firstOfSkill(xpTable.forName("logs"), Skill.WOODCUTTING);
+				l.text(", " + Reports.fmt(p.actionsRemaining) + " to " + p.targetLevel);
+				final long eta = a.etaMillis(now, p.actionsRemaining);
+				if (eta >= 0)
+				{
+					l.text(" ~" + TrackedAction.formatDuration(eta));
+				}
 			}
-			addGives(rates, logs, name);
+			lines.add(l);
 		}
-		else if (!rates.containsKey(Skill.WOODCUTTING))
-		{
-			// Some trees are just called "Oak", "Willow" or "Yew"
-			addGives(rates, firstOfSkill(xpTable.forName(lower + " logs"), Skill.WOODCUTTING), name);
-		}
-
-		if (includeLearned)
-		{
-			mergeLearned(LearnedRates.targetKey(name), rates);
-		}
-		return rates;
+		return lines;
 	}
 
-	private static XpTable.Entry firstOfSkill(List<XpTable.Entry> entries, Skill skill)
+	// ------------------------------------------------------------------
+	// Helpers
+	// ------------------------------------------------------------------
+
+	private void sendLines(List<Line> lines)
 	{
-		for (XpTable.Entry e : entries)
+		for (Line line : lines)
 		{
-			if (e.skill == skill)
-			{
-				return e;
-			}
+			sendChat(line.chat());
 		}
-		return null;
-	}
-
-	private void addGives(Map<Skill, XpRate> rates, XpTable.Entry entry, String targetName)
-	{
-		if (entry == null)
-		{
-			return;
-		}
-
-		String gives = entry.nameOverride != null ? entry.nameOverride : itemName(entry.itemId);
-		if (gives.equalsIgnoreCase(targetName))
-		{
-			// "Gem rocks (Gem rocks)" says nothing new
-			gives = null;
-		}
-		rates.putIfAbsent(entry.skill, new XpRate(entry.skill, entry.xp, entry.level, false, gives));
-	}
-
-	/** Swap in what you've actually been getting once it has been seen twice. */
-	private void mergeLearned(String key, Map<Skill, XpRate> rates)
-	{
-		if (!config.learnRates())
-		{
-			return;
-		}
-		for (Map.Entry<Skill, LearnedRates.Rate> e : learned.get(key).entrySet())
-		{
-			final XpRate base = rates.get(e.getKey());
-			final LearnedRates.Rate rate = e.getValue();
-			if (base == null || rate.samples >= 2)
-			{
-				rates.put(e.getKey(), new XpRate(e.getKey(), rate.average(),
-					base != null ? base.levelRequired : 0, true, base != null ? base.gives : null));
-			}
-		}
-	}
-
-	private void report(String name, Map<Skill, XpRate> rates)
-	{
-		if (rates.isEmpty())
-		{
-			sendChat(new ChatMessageBuilder()
-				.append(ChatColorType.HIGHLIGHT).append(name)
-				.append(ChatColorType.NORMAL).append(": no XP info yet. Do it once and the plugin will learn it.")
-				.build());
-			return;
-		}
-
-		for (XpRate rate : rates.values())
-		{
-			sendChat(describe(name, rate.gives, rate.skill, rate.xp, rate.levelRequired, rate.measured));
-		}
-	}
-
-	/**
-	 * Right-click on an NPC: thieving/hunter/fishing-spot info plus, for monsters,
-	 * kills to level with your current attack style and kills to your next Slayer level.
-	 */
-	private void reportNpc(NPC npc, String name, boolean attackable)
-	{
-		final Map<Skill, XpRate> skilling = ratesForTarget(name, true);
-		for (XpRate rate : skilling.values())
-		{
-			sendChat(describe(name, rate.gives, rate.skill, rate.xp, rate.levelRequired, rate.measured));
-		}
-
-		if (!attackable)
-		{
-			if (skilling.isEmpty())
-			{
-				report(name, skilling);
-			}
-			return;
-		}
-
-		final CombatStyle style = combat.currentStyle();
-		final Integer hp = combat.hitpoints(npc, name);
-		final Map<Skill, XpRate> rates = combat.rates(name, hp, style, null);
-
-		final ChatMessageBuilder header = new ChatMessageBuilder()
-			.append(ChatColorType.HIGHLIGHT).append(name)
-			.append(ChatColorType.NORMAL).append(hp != null ? " (" + hp + " hitpoints)" : "");
-		if (!style.isKnown())
-		{
-			header.append(": couldn't read your attack style. Open the combat tab once and try again.");
-		}
-		else if (rates.isEmpty())
-		{
-			header.append(", " + style.displayName + ": hitpoints unknown. Kill one and the plugin will learn its XP.");
-		}
-		else
-		{
-			header.append(", " + style.displayName + ":");
-		}
-		sendChat(header.build());
-
-		// Style skills first, then Hitpoints
-		for (XpRate rate : rates.values())
-		{
-			if (rate.skill != Skill.HITPOINTS)
-			{
-				sendChat(describeKills(null, rate));
-			}
-		}
-		final XpRate hitpoints = rates.get(Skill.HITPOINTS);
-		if (hitpoints != null)
-		{
-			sendChat(describeKills(null, hitpoints));
-		}
-
-		if (config.showSlayer())
-		{
-			final XpRate slayer = combat.slayerRate(name, hp, combat.slayerNote(npc, name));
-			if (slayer != null)
-			{
-				sendChat(describeKills(null, slayer));
-			}
-		}
-	}
-
-	/** e.g. "Strength: 87 kills to 71 (600 xp each)" or "Abyssal demon: 87 kills to Strength 71 (...)" */
-	private String describeKills(String name, XpRate rate)
-	{
-		final Skill skill = rate.skill;
-		final LevelMath.Progress p = progressFor(skill, rate.xp);
-		final ChatMessageBuilder msg = new ChatMessageBuilder();
-		if (name != null)
-		{
-			msg.append(ChatColorType.HIGHLIGHT).append(name).append(ChatColorType.NORMAL).append(": ");
-		}
-		else
-		{
-			msg.append("  " + skill.getName() + ": ");
-		}
-
-		final String skillPart = name != null ? skill.getName() + " " : "";
-		if (p.isMaxed())
-		{
-			msg.append(name != null ? skill.getName() + " is maxed" : "maxed");
-		}
-		else if (p.actionsRemaining < 0)
-		{
-			msg.append(String.format(Locale.ROOT, "%,d xp to %s%d", p.xpRemaining, skillPart, p.targetLevel));
-		}
-		else
-		{
-			msg.append(ChatColorType.HIGHLIGHT)
-				.append(String.format(Locale.ROOT, "%,d %s", p.actionsRemaining, p.actionsRemaining == 1 ? "kill" : "kills"))
-				.append(ChatColorType.NORMAL)
-				.append(" to " + skillPart + p.targetLevel
-					+ " (" + xpFormat.format(rate.xp) + " xp each" + (rate.measured ? ", measured" : "") + ")");
-		}
-
-		if (rate.note != null)
-		{
-			msg.append(" - " + rate.note);
-		}
-		return msg.build();
-	}
-
-	/** e.g. "Iron ore: 112 more to Mining 42 (35 xp each)" */
-	private String describe(String name, String gives, Skill skill, double xpEach, int levelRequired, boolean measured)
-	{
-		final LevelMath.Progress p = progressFor(skill, xpEach);
-		final ChatMessageBuilder msg = new ChatMessageBuilder()
-			.append(ChatColorType.HIGHLIGHT).append(name)
-			.append(ChatColorType.NORMAL).append(gives != null ? " (" + gives + "): " : ": ");
-
-		if (p.isMaxed())
-		{
-			msg.append(skill.getName() + " is maxed");
-		}
-		else if (p.actionsRemaining < 0)
-		{
-			msg.append(String.format(Locale.ROOT, "%,d xp to %s %d", p.xpRemaining, skill.getName(), p.targetLevel));
-		}
-		else
-		{
-			msg.append(ChatColorType.HIGHLIGHT)
-				.append(String.format(Locale.ROOT, "%,d more", p.actionsRemaining))
-				.append(ChatColorType.NORMAL)
-				.append(" to " + skill.getName() + " " + p.targetLevel
-					+ " (" + xpFormat.format(xpEach) + " xp each" + (measured ? ", measured" : "") + ")");
-		}
-
-		if (levelRequired > client.getRealSkillLevel(skill))
-		{
-			msg.append(" - needs level " + levelRequired);
-		}
-		return msg.build();
-	}
-
-	String formatXp(double xp)
-	{
-		return xpFormat.format(xp);
 	}
 
 	private void sendChat(String message)
@@ -1084,10 +1296,6 @@ public class ActionsToLevelPlugin extends Plugin
 			.runeLiteFormattedMessage(message)
 			.build());
 	}
-
-	// ------------------------------------------------------------------
-	// Helpers
-	// ------------------------------------------------------------------
 
 	private Map<Integer, Integer> readInventory()
 	{
@@ -1107,12 +1315,6 @@ public class ActionsToLevelPlugin extends Plugin
 		return counts;
 	}
 
-	private String itemName(int itemId)
-	{
-		final String name = itemManager.getItemComposition(itemId).getMembersName();
-		return name == null || "null".equalsIgnoreCase(name) ? "Item " + itemId : name;
-	}
-
 	private static String npcName(MenuEntry entry)
 	{
 		final NPC npc = entry.getNpc();
@@ -1126,7 +1328,7 @@ public class ActionsToLevelPlugin extends Plugin
 	}
 
 	/** "Raw shark -> Range" -> "Range" */
-	private static String afterArrow(String target)
+	static String afterArrow(String target)
 	{
 		if (target == null)
 		{
@@ -1136,7 +1338,7 @@ public class ActionsToLevelPlugin extends Plugin
 		return arrow >= 0 ? target.substring(arrow + 2) : target;
 	}
 
-	private static String cleanName(String s)
+	static String cleanName(String s)
 	{
 		if (s == null)
 		{
@@ -1146,12 +1348,24 @@ public class ActionsToLevelPlugin extends Plugin
 		return clean.isEmpty() || "null".equalsIgnoreCase(clean) ? null : clean;
 	}
 
-	private void saveLearned()
+	private void saveAll()
 	{
 		ticksSinceSave = 0;
 		if (learned.isDirty())
 		{
 			configManager.setConfiguration(ActionsToLevelConfig.GROUP, ActionsToLevelConfig.LEARNED_RATES_KEY, learned.serialize());
+		}
+		if (recipes.isDirty())
+		{
+			configManager.setConfiguration(ActionsToLevelConfig.GROUP, RecipeBook.RECIPES_KEY, recipes.serialize());
+		}
+		if (combat != null && combat.isMonstersDirty())
+		{
+			configManager.setConfiguration(ActionsToLevelConfig.GROUP, ActionsToLevelConfig.MONSTERS_KEY, combat.serializeMonsters());
+		}
+		if (bank != null)
+		{
+			bank.save();
 		}
 	}
 }

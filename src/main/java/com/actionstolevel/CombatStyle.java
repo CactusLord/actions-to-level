@@ -1,7 +1,9 @@
 package com.actionstolevel;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import net.runelite.api.Client;
@@ -72,6 +74,20 @@ enum CombatStyle
 			return OTHER;
 		}
 		return styles[styleIndex];
+	}
+
+	/** Every style the current weapon offers, in combat tab order. Must be called on the client thread. */
+	static List<CombatStyle> available(Client client)
+	{
+		final List<CombatStyle> out = new ArrayList<>();
+		for (CombatStyle style : stylesFor(client, client.getVarbitValue(VarbitID.COMBAT_WEAPON_CATEGORY)))
+		{
+			if (style != null && style.isKnown() && !out.contains(style))
+			{
+				out.add(style);
+			}
+		}
+		return out;
 	}
 
 	private static CombatStyle[] stylesFor(Client client, int weaponType)

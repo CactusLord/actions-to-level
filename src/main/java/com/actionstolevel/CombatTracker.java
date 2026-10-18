@@ -66,6 +66,8 @@ final class CombatTracker
 	private final Set<String> slayerNames = new HashSet<>();
 	/** Hitpoints by monster name, remembered from NPCs you've seen. */
 	private final Map<String, Integer> hitpointsByName = new HashMap<>();
+	/** Lower-case name -> name as the game shows it. */
+	private final Map<String, String> displayNames = new HashMap<>();
 	private final Map<Skill, Integer> xpSinceKill = new EnumMap<>(Skill.class);
 	private final List<String> pendingKills = new ArrayList<>();
 	private int pendingKillTick = -1;
@@ -75,6 +77,7 @@ final class CombatTracker
 	/** Kills that could give Slayer XP (on task, or unknown) since the last Slayer XP drop. */
 	private int killsSinceSlayerXp;
 	private int lastSlayerKillTick = -1000;
+	private boolean monstersDirty;
 
 	CombatTracker(Client client, NPCManager npcManager, SlayerPluginService slayer, LearnedRates learned)
 	{
@@ -355,6 +358,10 @@ final class CombatTracker
 	/** @return true/false when known, null when the Slayer plugin can't tell */
 	private Boolean isOnTask(NPC npc, String name)
 	{
+		if (remainingOnTask() <= 0)
+		{
+			return Boolean.FALSE;
+		}
 		if (npc != null && slayer != null)
 		{
 			try
@@ -387,12 +394,77 @@ final class CombatTracker
 				hp = npcManager.getHealth(comp.getId());
 			}
 		}
-		if (hp != null && hp > 0)
+		if (hp != null && hp > 0 && name != null)
 		{
-			hitpointsByName.put(name.toLowerCase(Locale.ROOT), hp);
+			final String key = name.toLowerCase(Locale.ROOT);
+			if (!hp.equals(hitpointsByName.put(key, hp)))
+			{
+				monstersDirty = true;
+			}
+			displayNames.put(key, name);
 			return hp;
 		}
 		return name == null ? null : hitpointsByName.get(name.toLowerCase(Locale.ROOT));
+	}
+
+	/** Monsters you've fought or looked up, by display name, with their hitpoints. */
+	Map<String, Integer> seenMonsters()
+	{
+		final Map<String, Integer> out = new HashMap<>();
+		for (Map.Entry<String, Integer> e : hitpointsByName.entrySet())
+		{
+			out.put(displayNames.getOrDefault(e.getKey(), e.getKey()), e.getValue());
+		}
+		return out;
+	}
+
+	boolean isMonstersDirty()
+	{
+		return monstersDirty;
+	}
+
+	/** Monsters you've fought or looked up: "Name|hitpoints" per line. */
+	String serializeMonsters()
+	{
+		final StringBuilder sb = new StringBuilder();
+		for (Map.Entry<String, Integer> e : hitpointsByName.entrySet())
+		{
+			sb.append(displayNames.getOrDefault(e.getKey(), e.getKey()).replace('|', ' ').replace('\n', ' '))
+				.append('|').append(e.getValue()).append('\n');
+		}
+		monstersDirty = false;
+		return sb.toString();
+	}
+
+	void deserializeMonsters(String data)
+	{
+		if (data == null)
+		{
+			return;
+		}
+		for (String line : data.split("\n"))
+		{
+			final int bar = line.lastIndexOf('|');
+			if (bar <= 0)
+			{
+				continue;
+			}
+			try
+			{
+				final String name = line.substring(0, bar);
+				final int hp = Integer.parseInt(line.substring(bar + 1).trim());
+				if (hp > 0)
+				{
+					hitpointsByName.put(name.toLowerCase(Locale.ROOT), hp);
+					displayNames.put(name.toLowerCase(Locale.ROOT), name);
+				}
+			}
+			catch (NumberFormatException ignored)
+			{
+				// skip
+			}
+		}
+		monstersDirty = false;
 	}
 
 	static boolean isAttackable(NPC npc)
@@ -445,7 +517,7 @@ final class CombatTracker
 		{
 			return null;
 		}
-		name = Text.removeTags(name).replace(' ', ' ').trim();
+		name = Text.removeTags(name).replace('\u00A0', ' ').trim();
 		return name.isEmpty() || "null".equalsIgnoreCase(name) ? null : name;
 	}
 }

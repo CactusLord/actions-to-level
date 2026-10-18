@@ -3,10 +3,12 @@ package com.actionstolevel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import javax.inject.Singleton;
 import net.runelite.api.Skill;
 import net.runelite.client.game.ItemManager;
@@ -28,6 +30,8 @@ class XpTable
 		final String nameOverride;
 		/** Lower-case display name, filled in by {@link #buildNameIndex(ItemManager)}. */
 		String name;
+		/** Display name as the game writes it. */
+		String displayName;
 
 		Entry(XpData.Row row)
 		{
@@ -112,6 +116,7 @@ class XpTable
 				continue;
 			}
 
+			entry.displayName = name;
 			entry.name = name.toLowerCase(Locale.ROOT);
 			index.computeIfAbsent(entry.name, k -> new ArrayList<>(1)).add(entry);
 
@@ -137,6 +142,64 @@ class XpTable
 		}
 		final List<Entry> entries = byName.get(name.toLowerCase(Locale.ROOT));
 		return entries == null ? Collections.emptyList() : entries;
+	}
+
+	/** Skills where the table's item is something you gather rather than make. */
+	private static final Set<Skill> GATHERING = EnumSet.of(Skill.MINING, Skill.WOODCUTTING, Skill.FISHING);
+
+	/** If this item is gathered (ore, logs, raw fish), the entry for gathering it; otherwise null. */
+	Entry gatheredBy(int itemId)
+	{
+		for (Entry e : forItem(itemId).values())
+		{
+			if (GATHERING.contains(e.skill))
+			{
+				return e;
+			}
+		}
+		return null;
+	}
+
+	/** Display names of everything that unlocks at exactly this level. Needs the name index. */
+	List<String> unlocksAt(Skill skill, int level)
+	{
+		final List<String> names = new ArrayList<>();
+		for (Entry e : all)
+		{
+			if (e.skill == skill && e.level == level && e.displayName != null && !names.contains(e.displayName))
+			{
+				names.add(e.displayName);
+			}
+		}
+		return names;
+	}
+
+	/** The next level above this one that unlocks something, or -1. */
+	int nextUnlockLevel(Skill skill, int level)
+	{
+		int best = -1;
+		for (Entry e : all)
+		{
+			if (e.skill == skill && e.level > level && (best == -1 || e.level < best))
+			{
+				best = e.level;
+			}
+		}
+		return best;
+	}
+
+	/** Every entry with a resolved name, for searching. Needs the name index. */
+	List<Entry> named()
+	{
+		final List<Entry> out = new ArrayList<>();
+		for (Entry e : all)
+		{
+			if (e.name != null)
+			{
+				out.add(e);
+			}
+		}
+		return out;
 	}
 
 	/** First entry of the given skill whose name starts with the prefix (case-insensitive). */

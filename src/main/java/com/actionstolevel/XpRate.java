@@ -19,13 +19,15 @@ final class XpRate
 	final boolean perKill;
 	/** Extra text shown after the count, e.g. Slayer task status. */
 	final String note;
+	/** The item each action uses up (logs burned, bones buried, raw fish cooked), or -1. */
+	final int consumesItemId;
 
 	XpRate(Skill skill, double xp, int levelRequired, boolean measured, String gives)
 	{
-		this(skill, xp, levelRequired, measured, gives, false, null);
+		this(skill, xp, levelRequired, measured, gives, false, null, -1);
 	}
 
-	private XpRate(Skill skill, double xp, int levelRequired, boolean measured, String gives, boolean perKill, String note)
+	private XpRate(Skill skill, double xp, int levelRequired, boolean measured, String gives, boolean perKill, String note, int consumesItemId)
 	{
 		this.skill = skill;
 		this.xp = xp;
@@ -34,10 +36,21 @@ final class XpRate
 		this.gives = gives;
 		this.perKill = perKill;
 		this.note = note;
+		this.consumesItemId = consumesItemId;
 	}
 
 	static XpRate perKill(Skill skill, double xp, boolean measured, String note)
 	{
-		return new XpRate(skill, xp, 0, measured, null, true, note);
+		return new XpRate(skill, xp, 0, measured, null, true, note, -1);
+	}
+
+	XpRate consuming(int itemId)
+	{
+		return new XpRate(skill, xp, levelRequired, measured, gives, perKill, note, itemId);
+	}
+
+	XpRate withXp(double newXp, String newNote)
+	{
+		return new XpRate(skill, newXp, levelRequired, measured, gives, perKill, newNote, consumesItemId);
 	}
 }
